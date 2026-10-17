@@ -5901,10 +5901,31 @@ class Pizlonator {
         else {
           canonicalizeAccessChecks(Checks);
           bool HasNonBackEdgePred = false;
+          bool FunctionMayFree = false;
+          for (BasicBlock* FBB : Blocks) {
+            for (Instruction& FI : *FBB) {
+              if (instructionMayFree(&FI)) {
+                FunctionMayFree = true;
+                break;
+              }
+            }
+            if (FunctionMayFree)
+              break;
+          }
           for (BasicBlock* PBB : predecessors(BB)) {
             if (!BackEdgePreds.count(PBB)) {
               HasNonBackEdgePred = true;
               break;
+            }
+          }
+          if (HasNonBackEdgePred && FunctionMayFree) {
+            for (BasicBlock* PBB : predecessors(BB)) {
+              if (BackEdgePreds.count(PBB)) {
+                EraseIf(Checks, [&] (const AccessCheck& AC) -> bool {
+                  return AC.CK == CheckKind::NotFree;
+                });
+                break;
+              }
             }
           }
           for (BasicBlock* PBB : predecessors(BB)) {
@@ -17760,6 +17781,24 @@ public:
     if (!NormalEB)
       return false;
 
+    // Ensure no external calls (such as free/realloc) occur inside non-fail loop blocks.
+    for (BasicBlock *BB : L->blocks()) {
+      if (isFailBlock(BB))
+        continue;
+      for (Instruction &I : *BB) {
+        if (CallInst *CI = dyn_cast<CallInst>(&I)) {
+          if (isa<IntrinsicInst>(CI))
+            continue;
+          if (Function *Callee = CI->getCalledFunction()) {
+            StringRef Name = Callee->getName();
+            if (Name.contains("pollcheck") || Name.contains("access_check") || Name.contains("range_fail"))
+              continue;
+          }
+          return false;
+        }
+      }
+    }
+
     const SCEV *EC = SE.getExitCount(L, NormalEB);
     if (!EC || isa<SCEVCouldNotCompute>(EC))
       return false;
@@ -17781,11 +17820,12 @@ public:
     struct PointerBoundsSCEV {
       const SCEV *Start = nullptr;
       const SCEV *Max = nullptr;
+      APInt MaxSafeBTC{64, UINT64_MAX};
       bool Valid = false;
     };
 
-    std::function<const SCEV *(const SCEV *, const SCEV *)> evalSCEV =
-        [&](const SCEV *S, const SCEV *Iter) -> const SCEV * {
+    std::function<const SCEV *(const SCEV *, const SCEV *, bool, APInt, APInt &)> evalSCEV =
+        [&](const SCEV *S, const SCEV *Iter, bool InSignExtend, APInt OuterScale, APInt &MaxSafeBTC) -> const SCEV * {
       if (!S)
         return nullptr;
       if (SE.isLoopInvariant(S, L))
@@ -17795,6 +17835,27 @@ public:
           const SCEV *Step = AR->getStepRecurrence(SE);
           const SCEVConstant *ConstStep = dyn_cast<SCEVConstant>(Step);
           if (ConstStep && !ConstStep->getAPInt().isNegative() && !ConstStep->getAPInt().isZero()) {
+            APInt StepAP = ConstStep->getAPInt();
+            unsigned BW = StepAP.getBitWidth();
+            APInt Limit = InSignExtend ? APInt::getSignedMaxValue(BW) : APInt::getMaxValue(BW);
+            if (InSignExtend) {
+              const SCEVConstant *StartC = dyn_cast<SCEVConstant>(AR->getStart());
+              if (!StartC || StartC->getAPInt().isNegative())
+                return nullptr;
+              Limit -= StartC->getAPInt();
+            } else if (const SCEVConstant *StartC = dyn_cast<SCEVConstant>(AR->getStart())) {
+              if (Limit.ult(StartC->getAPInt()))
+                return nullptr;
+              Limit -= StartC->getAPInt();
+            }
+            APInt MaxIterBW = Limit.udiv(StepAP).zextOrTrunc(64);
+            bool ScaleOv = false;
+            APInt EffectiveStep64 = StepAP.zextOrTrunc(64).umul_ov(OuterScale, ScaleOv);
+            if (ScaleOv || EffectiveStep64.isZero())
+              return nullptr;
+            APInt MaxIter64 = APInt::getMaxValue(64).udiv(EffectiveStep64);
+            MaxSafeBTC = APIntOps::umin(MaxSafeBTC, APIntOps::umin(MaxIterBW, MaxIter64));
+
             const SCEV *AdaptedIter = Iter;
             if (AR->getType()->isIntegerTy() && Iter->getType() != AR->getType()) {
               AdaptedIter = SE.getTruncateOrZeroExtend(Iter, AR->getType());
@@ -17807,9 +17868,11 @@ public:
         return nullptr;
       }
       if (const SCEVAddExpr *Add = dyn_cast<SCEVAddExpr>(S)) {
+        if (InSignExtend)
+          return nullptr;
         SmallVector<const SCEV *, 4> Ops;
         for (const SCEV *Op : Add->operands()) {
-          const SCEV *EOp = evalSCEV(Op, Iter);
+          const SCEV *EOp = evalSCEV(Op, Iter, false, OuterScale, MaxSafeBTC);
           if (!EOp)
             return nullptr;
           Ops.push_back(EOp);
@@ -17817,9 +17880,27 @@ public:
         return SE.getAddExpr(Ops);
       }
       if (const SCEVMulExpr *Mul = dyn_cast<SCEVMulExpr>(S)) {
+        if (InSignExtend)
+          return nullptr;
+        APInt NewScale = OuterScale;
+        unsigned VariantCount = 0;
+        for (const SCEV *Op : Mul->operands()) {
+          if (SE.isLoopInvariant(Op, L)) {
+            const SCEVConstant *C = dyn_cast<SCEVConstant>(Op);
+            if (!C || C->getAPInt().isNegative() || C->getAPInt().isZero())
+              return nullptr;
+            bool Ov = false;
+            NewScale = NewScale.umul_ov(C->getAPInt().zextOrTrunc(64), Ov);
+            if (Ov)
+              return nullptr;
+          } else {
+            if (++VariantCount > 1)
+              return nullptr;
+          }
+        }
         SmallVector<const SCEV *, 4> Ops;
         for (const SCEV *Op : Mul->operands()) {
-          const SCEV *EOp = evalSCEV(Op, Iter);
+          const SCEV *EOp = evalSCEV(Op, Iter, false, NewScale, MaxSafeBTC);
           if (!EOp)
             return nullptr;
           Ops.push_back(EOp);
@@ -17827,16 +17908,12 @@ public:
         return SE.getMulExpr(Ops);
       }
       if (const SCEVZeroExtendExpr *ZExt = dyn_cast<SCEVZeroExtendExpr>(S)) {
-        const SCEV *EOp = evalSCEV(ZExt->getOperand(), Iter);
+        const SCEV *EOp = evalSCEV(ZExt->getOperand(), Iter, false, OuterScale, MaxSafeBTC);
         return EOp ? SE.getZeroExtendExpr(EOp, ZExt->getType()) : nullptr;
       }
       if (const SCEVSignExtendExpr *SExt = dyn_cast<SCEVSignExtendExpr>(S)) {
-        const SCEV *EOp = evalSCEV(SExt->getOperand(), Iter);
+        const SCEV *EOp = evalSCEV(SExt->getOperand(), Iter, true, OuterScale, MaxSafeBTC);
         return EOp ? SE.getSignExtendExpr(EOp, SExt->getType()) : nullptr;
-      }
-      if (const SCEVTruncateExpr *Trunc = dyn_cast<SCEVTruncateExpr>(S)) {
-        const SCEV *EOp = evalSCEV(Trunc->getOperand(), Iter);
-        return EOp ? SE.getTruncateExpr(EOp, Trunc->getType()) : nullptr;
       }
       return nullptr;
     };
@@ -17844,10 +17921,12 @@ public:
     auto analyzePointerSCEV = [&](Value *PtrVal) -> PointerBoundsSCEV {
       const SCEV *PtrSCEV = SE.getSCEV(PtrVal);
       const SCEV *Zero = SE.getZero(BTC->getType());
-      const SCEV *Start = evalSCEV(PtrSCEV, Zero);
-      const SCEV *Max = evalSCEV(PtrSCEV, BTC);
+      APInt DummySafe{64, UINT64_MAX};
+      APInt MaxSafeBTC{64, UINT64_MAX};
+      const SCEV *Start = evalSCEV(PtrSCEV, Zero, false, APInt(64, 1), DummySafe);
+      const SCEV *Max = evalSCEV(PtrSCEV, BTC, false, APInt(64, 1), MaxSafeBTC);
       if (Start && Max && SE.isLoopInvariant(Start, L) && SE.isLoopInvariant(Max, L))
-        return {Start, Max, true};
+        return {Start, Max, MaxSafeBTC, true};
 
       if (PHINode *PN = dyn_cast<PHINode>(PtrVal)) {
         if (PN->getParent() == L->getHeader() && PN->getNumIncomingValues() == 2) {
@@ -17861,21 +17940,24 @@ public:
             if (const SCEVConstant *C = dyn_cast<SCEVConstant>(BTC)) {
               if (C->isZero()) {
                 if (SE.isLoopInvariant(StartSCEV, L))
-                  return {StartSCEV, StartSCEV, true};
+                  return {StartSCEV, StartSCEV, APInt(64, UINT64_MAX), true};
               }
             }
 
             const SCEV *One = SE.getOne(BTC->getType());
             const SCEV *BTCMinusOne = SE.getMinusSCEV(BTC, One);
-            const SCEV *MaxSCEV = evalSCEV(LoopValSCEV, BTCMinusOne);
+            APInt PhiSafeBTC{64, UINT64_MAX};
+            const SCEV *MaxSCEV = evalSCEV(LoopValSCEV, BTCMinusOne, false, APInt(64, 1), PhiSafeBTC);
             if (MaxSCEV && SE.isLoopInvariant(StartSCEV, L) && SE.isLoopInvariant(MaxSCEV, L)) {
-              return {StartSCEV, MaxSCEV, true};
+              if (PhiSafeBTC != UINT64_MAX)
+                PhiSafeBTC += 1;
+              return {StartSCEV, MaxSCEV, PhiSafeBTC, true};
             }
           }
         }
       }
 
-      return {nullptr, nullptr, false};
+      return {nullptr, nullptr, APInt(64, UINT64_MAX), false};
     };
 
     struct BoundCheckInfo {
@@ -17888,6 +17970,7 @@ public:
       bool Invert; // true if cond == true means success
       const SCEV *Start;
       const SCEV *Max;
+      APInt MaxSafeBTC;
       CheckType Type;
       ICmpInst::Predicate Pred;
     };
@@ -17895,7 +17978,7 @@ public:
     SmallVector<BoundCheckInfo, 8> ChecksToEliminate;
 
     for (BasicBlock *BB : L->blocks()) {
-      if (!DT.dominates(BB, Latch))
+      if (!DT.dominates(BB, Latch) || !DT.dominates(BB, NormalEB))
         continue;
 
       BranchInst *BI = dyn_cast<BranchInst>(BB->getTerminator());
@@ -18004,7 +18087,7 @@ public:
         errs() << "\n";
       }
 
-      ChecksToEliminate.push_back({BI, Cmp, Ptr, BoundVal, FailB, SuccessB, Invert, Bounds.Start, Bounds.Max, CType, Pred});
+      ChecksToEliminate.push_back({BI, Cmp, Ptr, BoundVal, FailB, SuccessB, Invert, Bounds.Start, Bounds.Max, Bounds.MaxSafeBTC, CType, Pred});
     }
 
     if (ChecksToEliminate.empty())
@@ -18090,16 +18173,28 @@ public:
         }
 
         Instruction *InsertPt = Preheader->getTerminator();
+        Value *StartPtr = Expander.expandCodeFor(Info.Start, Info.Ptr->getType(), InsertPt);
         Value *MaxPtr = Expander.expandCodeFor(Info.Max, Info.Ptr->getType(), InsertPt);
+        Value *BTCVal = Expander.expandCodeFor(BTC, BTC->getType(), InsertPt);
 
         IRBuilder<> Builder(InsertPt);
-        Value *AllInBounds = nullptr;
-        if (Info.Pred == ICmpInst::ICMP_ULT || Info.Pred == ICmpInst::ICMP_UGE)
-          AllInBounds = Builder.CreateICmpULT(MaxPtr, HoistedUpperMinus, "filc_all_in_bounds");
-        else
-          AllInBounds = Builder.CreateICmpULE(MaxPtr, HoistedUpperMinus, "filc_all_in_bounds");
+        Type *Int64Ty = Type::getInt64Ty(F.getContext());
+        Value *BTC64 = Builder.CreateZExtOrTrunc(BTCVal, Int64Ty, "filc_btc64");
+        Value *IterSafe = Builder.CreateICmpULE(BTC64, ConstantInt::get(Int64Ty, Info.MaxSafeBTC), "filc_iter_safe");
+        Value *PtrNoWrap = Builder.CreateICmpUGE(MaxPtr, StartPtr, "filc_ptr_nowrap");
+        Value *NoWrapCond = Builder.CreateAnd(IterSafe, PtrNoWrap, "filc_nowrap_cond");
 
-        BasicBlock *HoistedFailB = createHoistedFailBlock(MaxPtr, Info.FailB);
+        Value *InBoundsCond = nullptr;
+        if (Info.Pred == ICmpInst::ICMP_ULT || Info.Pred == ICmpInst::ICMP_UGE)
+          InBoundsCond = Builder.CreateICmpULT(MaxPtr, HoistedUpperMinus, "filc_in_bounds_raw");
+        else
+          InBoundsCond = Builder.CreateICmpULE(MaxPtr, HoistedUpperMinus, "filc_in_bounds_raw");
+
+        Value *AllInBounds = Builder.CreateAnd(NoWrapCond, InBoundsCond, "filc_all_in_bounds");
+        Value *OOBFallbackPtr = Builder.CreateGEP(Type::getInt8Ty(F.getContext()), HoistedUpperMinus, ConstantInt::get(Int64Ty, 1), "filc_oob_fallback_ptr");
+        Value *FailingPtr = Builder.CreateSelect(NoWrapCond, MaxPtr, OOBFallbackPtr, "filc_failing_ptr");
+
+        BasicBlock *HoistedFailB = createHoistedFailBlock(FailingPtr, Info.FailB);
 
         Instruction *PreheaderTerm = Preheader->getTerminator();
         BasicBlock *NewPreheader = SplitBlock(Preheader, PreheaderTerm, &DT, &LI);
@@ -18118,14 +18213,25 @@ public:
         Preheader = NewPreheader;
         Modified = true;
       } else {
-        // Lower bound check: StartPtr >= Lower
+        // Lower bound check: StartPtr >= Lower && NoWrapCond
         Instruction *InsertPt = Preheader->getTerminator();
         Value *StartPtr = Expander.expandCodeFor(Info.Start, Info.Ptr->getType(), InsertPt);
+        Value *MaxPtr = Expander.expandCodeFor(Info.Max, Info.Ptr->getType(), InsertPt);
+        Value *BTCVal = Expander.expandCodeFor(BTC, BTC->getType(), InsertPt);
 
         IRBuilder<> Builder(InsertPt);
-        Value *LowerInBounds = Builder.CreateICmpUGE(StartPtr, Info.BoundVal, "filc_lower_in_bounds");
+        Type *Int64Ty = Type::getInt64Ty(F.getContext());
+        Value *BTC64 = Builder.CreateZExtOrTrunc(BTCVal, Int64Ty, "filc_btc64_low");
+        Value *IterSafe = Builder.CreateICmpULE(BTC64, ConstantInt::get(Int64Ty, Info.MaxSafeBTC), "filc_iter_safe_low");
+        Value *PtrNoWrap = Builder.CreateICmpUGE(MaxPtr, StartPtr, "filc_ptr_nowrap_low");
+        Value *NoWrapCond = Builder.CreateAnd(IterSafe, PtrNoWrap, "filc_nowrap_cond_low");
+        Value *LowerInBoundsRaw = Builder.CreateICmpUGE(StartPtr, Info.BoundVal, "filc_lower_in_bounds_raw");
+        Value *LowerInBounds = Builder.CreateAnd(NoWrapCond, LowerInBoundsRaw, "filc_lower_in_bounds");
 
-        BasicBlock *HoistedFailB = createHoistedFailBlock(StartPtr, Info.FailB);
+        Value *OOBFallbackLow = Builder.CreateGEP(Type::getInt8Ty(F.getContext()), Info.BoundVal, ConstantInt::getSigned(Int64Ty, -1), "filc_oob_fallback_low");
+        Value *FailingPtr = Builder.CreateSelect(NoWrapCond, StartPtr, OOBFallbackLow, "filc_failing_ptr_low");
+
+        BasicBlock *HoistedFailB = createHoistedFailBlock(FailingPtr, Info.FailB);
 
         Instruction *PreheaderTerm = Preheader->getTerminator();
         BasicBlock *NewPreheader = SplitBlock(Preheader, PreheaderTerm, &DT, &LI);
@@ -18164,6 +18270,64 @@ public:
 
     for (Loop *L : Worklist)
       Changed |= eliminateBoundsChecksInLoop(L);
+
+    // Also eliminate duplicate bounds checks along single-predecessor SafeSucc chains
+    // (e.g. multiple reads/writes to p[i] within the same loop iteration).
+    for (BasicBlock &BB : F) {
+      BasicBlock *Pred = BB.getSinglePredecessor();
+      if (!Pred)
+        continue;
+      BranchInst *PredBI = dyn_cast<BranchInst>(Pred->getTerminator());
+      if (!PredBI || !PredBI->isConditional())
+        continue;
+      ICmpInst *PredCmp = dyn_cast<ICmpInst>(PredBI->getCondition());
+      if (!PredCmp)
+        continue;
+      bool PredTrueFail = isFailBlock(PredBI->getSuccessor(0));
+      bool PredFalseFail = isFailBlock(PredBI->getSuccessor(1));
+      if (!PredTrueFail && !PredFalseFail)
+        continue;
+
+      // Walk forward along single-predecessor safe chain as long as no CallInst intervenes
+      BasicBlock *Cur = &BB;
+      for (unsigned Depth = 0; Cur && Depth < 16; ++Depth) {
+        if (Cur != &BB && Cur->getSinglePredecessor() == nullptr)
+          break;
+        bool HasCall = false;
+        for (Instruction &I : *Cur) {
+          if (CallInst *CI = dyn_cast<CallInst>(&I)) {
+            if (!isa<IntrinsicInst>(CI)) {
+              HasCall = true;
+              break;
+            }
+          }
+        }
+        BranchInst *CurBI = dyn_cast<BranchInst>(Cur->getTerminator());
+        if (!CurBI || !CurBI->isConditional())
+          break;
+        ICmpInst *CurCmp = dyn_cast<ICmpInst>(CurBI->getCondition());
+        bool CurTrueFail = isFailBlock(CurBI->getSuccessor(0));
+        bool CurFalseFail = isFailBlock(CurBI->getSuccessor(1));
+        if (CurCmp && (CurTrueFail || CurFalseFail)) {
+          if (CurCmp->getPredicate() == PredCmp->getPredicate() &&
+              CurCmp->getOperand(0) == PredCmp->getOperand(0) &&
+              CurCmp->getOperand(1) == PredCmp->getOperand(1) &&
+              CurTrueFail == PredTrueFail) {
+            if (CurTrueFail)
+              CurBI->setCondition(ConstantInt::getFalse(Type::getInt1Ty(F.getContext())));
+            else
+              CurBI->setCondition(ConstantInt::getTrue(Type::getInt1Ty(F.getContext())));
+            Changed = true;
+          }
+        }
+        if (HasCall)
+          break;
+        BasicBlock *NextSafe = CurTrueFail ? CurBI->getSuccessor(1) : (CurFalseFail ? CurBI->getSuccessor(0) : nullptr);
+        if (!NextSafe || NextSafe->getSinglePredecessor() != Cur)
+          break;
+        Cur = NextSafe;
+      }
+    }
 
     if (Changed)
       DT.recalculate(F);
